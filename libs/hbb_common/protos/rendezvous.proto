@@ -82,6 +82,7 @@ message PunchHoleResponse {
     LICENSE_MISMATCH = 3;
     LICENSE_OVERUSE = 4;
     IPV6_UNSUPPORTED = 5;
+    IPV4_UNSUPPORTED = 6;
   }
   Failure failure = 3;
   string relay_server = 4;
