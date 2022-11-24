@@ -778,6 +778,14 @@ impl RendezvousServer {
                 });
                 return Ok((msg_out, None));
             }
+            if addr.is_ipv4() && peer_addr.is_ipv6() {
+                let mut msg_out = RendezvousMessage::new();
+                msg_out.set_punch_hole_response(PunchHoleResponse {
+                    failure: punch_hole_response::Failure::IPV4_UNSUPPORTED.into(),
+                    ..Default::default()
+                });
+                return Ok((msg_out, None));
+            }
             let mut msg_out = RendezvousMessage::new();
             let peer_is_lan = self.is_lan(peer_addr);
             let is_lan = self.is_lan(addr);
