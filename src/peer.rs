@@ -4,15 +4,25 @@ use hbb_common::{
     bytes::Bytes,
     log,
     rendezvous_proto::*,
+    sodiumoxide::crypto::sign,
     tokio::sync::{Mutex, RwLock},
     ResultType,
 };
 use serde_derive::{Deserialize, Serialize};
 use std::{collections::HashMap, collections::HashSet, net::SocketAddr, sync::Arc, time::Instant};
 
-type IpBlockMap = HashMap<String, ((u32, Instant), (HashSet<String>, Instant))>;
+pub(crate) const MAX_PEER_ID_LEN: usize = 253;
+// RegisterPk.uuid is machine_uid bytes, not an RFC UUID string. Normal sources are
+// Linux machine-id (32 bytes), macOS IOPlatformUUID (36 bytes), Windows MachineGuid
+// (usually 36 bytes), and iOS/Android or machine_uid failure fallback public key
+// (32 bytes). This high ceiling only prevents malicious or broken clients from
+// persisting oversized uuid blobs in memory, SQLite, and logs.
+pub(crate) const MAX_REGISTER_UUID_LEN: usize = 2048;
+pub(crate) const REGISTER_PK_LEN: usize = sign::PUBLICKEYBYTES;
+
+pub(crate) type IpBlockMap = HashMap<String, ((u32, Instant), (HashSet<String>, Instant))>;
 type UserStatusMap = HashMap<Vec<u8>, Arc<(Option<Vec<u8>>, bool)>>;
-type IpChangesMap = HashMap<String, (Instant, HashMap<String, i32>)>;
+pub(crate) type IpChangesMap = HashMap<String, (Instant, HashMap<String, i32>)>;
 lazy_static::lazy_static! {
     pub(crate) static ref IP_BLOCKER: Mutex<IpBlockMap> = Default::default();
     pub(crate) static ref USER_STATUS: RwLock<UserStatusMap> = Default::default();
@@ -22,6 +32,14 @@ pub const IP_CHANGE_DUR: u64 = 180;
 pub const IP_CHANGE_DUR_X2: u64 = IP_CHANGE_DUR * 2;
 pub const DAY_SECONDS: u64 = 3600 * 24;
 pub const IP_BLOCK_DUR: u64 = 60;
+
+pub(crate) fn is_valid_peer_id_len(id: &str) -> bool {
+    !id.is_empty() && id.len() <= MAX_PEER_ID_LEN
+}
+
+pub(crate) fn is_valid_register_material(uuid_len: usize, pk_len: usize) -> bool {
+    uuid_len > 0 && uuid_len <= MAX_REGISTER_UUID_LEN && pk_len == REGISTER_PK_LEN
+}
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
 pub(crate) struct PeerInfo {
@@ -99,6 +117,9 @@ impl PeerMap {
         pk: Bytes,
         ip: String,
     ) -> register_pk_response::Result {
+        if !is_valid_peer_id_len(&id) || !is_valid_register_material(uuid.len(), pk.len()) {
+            return register_pk_response::Result::UUID_MISMATCH;
+        }
         log::info!("update_pk {} {:?} {:?} {:?}", id, addr, uuid, pk);
         let (info_str, guid) = {
             let mut w = peer.write().await;
@@ -156,6 +177,9 @@ impl PeerMap {
 
     #[inline]
     pub(crate) async fn get_or(&self, id: &str) -> LockPeer {
+        if !is_valid_peer_id_len(id) {
+            return LockPeer::default();
+        }
         if let Some(p) = self.get(id).await {
             return p;
         }

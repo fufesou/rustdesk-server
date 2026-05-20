@@ -340,12 +340,12 @@ impl RendezvousServer {
                     }
                 }
                 Some(rendezvous_message::Union::RegisterPk(rk)) => {
-                    if rk.uuid.is_empty() || rk.pk.is_empty() {
+                    if !is_valid_register_material(rk.uuid.len(), rk.pk.len()) {
                         return Ok(());
                     }
                     let id = rk.id;
                     let ip = addr.ip().to_string();
-                    if id.len() < 6 {
+                    if id.len() < 6 || !is_valid_peer_id_len(&id) {
                         return send_rk_res(socket, addr, UUID_MISMATCH).await;
                     } else if !self.check_ip_blocker(&ip, &id).await {
                         return send_rk_res(socket, addr, TOO_FREQUENT).await;
