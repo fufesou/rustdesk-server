@@ -47,7 +47,7 @@ enum Data {
     RelayServers(RelayServers),
 }
 
-const REG_TIMEOUT: i32 = 30_000;
+const REG_TIMEOUT: u64 = 30_000;
 type TcpStreamSink = SplitSink<Framed<TcpStream, BytesCodec>, Bytes>;
 type WsSink = SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, tungstenite::Message>;
 enum Sink {
@@ -68,6 +68,10 @@ use tokio::sync::Mutex as TokioMutex; // differentiate if needed
 struct PunchReqEntry { tm: Instant, from_ip: String, to_ip: String, to_id: String }
 static PUNCH_REQS: Lazy<TokioMutex<Vec<PunchReqEntry>>> = Lazy::new(|| TokioMutex::new(Vec::new()));
 const PUNCH_REQ_DEDUPE_SEC: u64 = 60;
+
+fn is_recent_registration_elapsed(elapsed: Duration) -> bool {
+    elapsed < Duration::from_millis(REG_TIMEOUT)
+}
 
 #[derive(Clone)]
 struct Inner {
@@ -705,9 +709,9 @@ impl RendezvousServer {
         if let Some(peer) = self.pm.get(&id).await {
             let (elapsed, peer_addr) = {
                 let r = peer.read().await;
-                (r.last_reg_time.elapsed().as_millis() as i32, r.socket_addr)
+                (r.last_reg_time.elapsed(), r.socket_addr)
             };
-            if elapsed >= REG_TIMEOUT {
+            if !is_recent_registration_elapsed(elapsed) {
                 let mut msg_out = RendezvousMessage::new();
                 msg_out.set_punch_hole_response(PunchHoleResponse {
                     failure: punch_hole_response::Failure::OFFLINE.into(),
@@ -798,11 +802,11 @@ impl RendezvousServer {
         let mut states = BytesMut::zeroed((peers.len() + 7) / 8);
         for (i, peer_id) in peers.iter().enumerate() {
             if let Some(peer) = self.pm.get_in_memory(peer_id).await {
-                let elapsed = peer.read().await.last_reg_time.elapsed().as_millis() as i32;
+                let elapsed = peer.read().await.last_reg_time.elapsed();
                 // bytes index from left to right
                 let states_idx = i / 8;
                 let bit_idx = 7 - i % 8;
-                if elapsed < REG_TIMEOUT {
+                if is_recent_registration_elapsed(elapsed) {
                     states[states_idx] |= 0x01 << bit_idx;
                 }
             }
@@ -1269,6 +1273,28 @@ impl RendezvousServer {
             }
         }
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stale_registration_after_i32_millis_wrap_is_not_recent() {
+        let stale = Duration::from_secs(25 * 24 * 60 * 60);
+
+        assert!(!is_recent_registration_elapsed(stale));
+    }
+
+    #[test]
+    fn registration_recentness_uses_timeout_boundary() {
+        assert!(is_recent_registration_elapsed(Duration::from_millis(
+            REG_TIMEOUT - 1
+        )));
+        assert!(!is_recent_registration_elapsed(Duration::from_millis(
+            REG_TIMEOUT
+        )));
     }
 }
 
