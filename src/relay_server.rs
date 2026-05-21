@@ -581,6 +581,10 @@ fn get_server_sk(key: &str) -> String {
 
     if !key.is_empty() {
         log::info!("Key: {}", key);
+    } else {
+        log::warn!(
+            "WARNING: hbbr is running in PUBLIC RELAY MODE because the configured key (-k/KEY) is empty; any client can use this relay"
+        );
     }
 
     key

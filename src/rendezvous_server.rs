@@ -1256,6 +1256,10 @@ impl RendezvousServer {
 
         if !key.is_empty() {
             log::info!("Key: {}", key);
+        } else {
+            log::warn!(
+                "WARNING: hbbs is running in OPEN RESPONDER MODE because the configured key (-k/KEY/config) is empty; punch-hole request keys will not be checked"
+            );
         }
         (key, out_sk)
     }
