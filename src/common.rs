@@ -193,6 +193,46 @@ pub fn now() -> u64 {
         .unwrap_or_default()
 }
 
+#[cfg(unix)]
+const PRIVATE_KEY_FILE_MODE: u32 = 0o600;
+
+fn create_private_key_file(path: &str) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+        {
+            Ok(file) => {
+                if let Err(err) =
+                    file.set_permissions(std::fs::Permissions::from_mode(PRIVATE_KEY_FILE_MODE))
+                {
+                    log::warn!(
+                        "Failed to set permissions for private key file {}: {}",
+                        path,
+                        err
+                    );
+                }
+                Ok(file)
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .truncate(true)
+                    .open(path)
+            }
+            Err(err) => Err(err),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::File::create(path)
+    }
+}
+
 pub fn gen_sk(wait: u64) -> (String, Option<sign::SecretKey>) {
     let sk_file = "id_ed25519";
     if wait > 0 && !std::path::Path::new(sk_file).exists() {
@@ -230,7 +270,7 @@ pub fn gen_sk(wait: u64) -> (String, Option<sign::SecretKey>) {
         let pub_file = format!("{sk_file}.pub");
         if let Ok(mut f) = std::fs::File::create(&pub_file) {
             f.write_all(pk.as_bytes()).ok();
-            if let Ok(mut f) = std::fs::File::create(sk_file) {
+            if let Ok(mut f) = create_private_key_file(sk_file) {
                 let s = base64::encode(&sk);
                 if f.write_all(s.as_bytes()).is_ok() {
                     log::info!("Private/public key written to {}/{}", sk_file, pub_file);
@@ -398,5 +438,62 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_key_file_permissions() {
+        use std::process::Command;
+
+        const CHILD_ENV: &str = "RUSTDESK_PRIVATE_KEY_TEST_CHILD";
+        const CHILD_COMPLETED: &str = "private_key_test_child_completed";
+        const TEST_NAME: &str = "common::tests::private_key_file_permissions";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            const TEST_UMASK: hbb_common::libc::mode_t = 0o022;
+            // The child process isolates the umask from other tests.
+            unsafe { hbb_common::libc::umask(TEST_UMASK) };
+            assert_private_key_file_permissions();
+            println!("{CHILD_COMPLETED}");
+            return;
+        }
+
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST_NAME, "--nocapture"])
+            .env(CHILD_ENV, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains(CHILD_COMPLETED),
+            "key-file test failed ({}):\n{stdout}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    fn assert_private_key_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        const PERMISSION_BITS: u32 = 0o777;
+        const NEW_FILE_MODE: u32 = 0o600;
+        const EXISTING_MODE: u32 = 0o644;
+        let path =
+            std::env::temp_dir().join(format!("rustdesk-private-key-{}", uuid::Uuid::new_v4()));
+        let file = create_private_key_file(path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            file.metadata().unwrap().permissions().mode() & PERMISSION_BITS,
+            NEW_FILE_MODE
+        );
+        file.set_permissions(std::fs::Permissions::from_mode(EXISTING_MODE))
+            .unwrap();
+        drop(file);
+        let file = create_private_key_file(path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            file.metadata().unwrap().permissions().mode() & PERMISSION_BITS,
+            EXISTING_MODE
+        );
+        drop(file);
+        std::fs::remove_file(path).unwrap();
     }
 }
