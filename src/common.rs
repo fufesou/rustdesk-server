@@ -196,91 +196,115 @@ pub fn now() -> u64 {
 #[cfg(unix)]
 const PRIVATE_KEY_FILE_MODE: u32 = 0o600;
 
-fn create_private_key_file(path: &str) -> std::io::Result<std::fs::File> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
+#[cfg(not(unix))]
+fn create_private_key_file(path: &str) -> ResultType<std::fs::File> {
+    Ok(std::fs::File::create(path)?)
+}
 
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)
-        {
+#[cfg(unix)]
+fn create_private_key_file(path: &str) -> ResultType<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut path = std::path::PathBuf::from(path);
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .write(true)
+        .create_new(true)
+        .mode(PRIVATE_KEY_FILE_MODE);
+    loop {
+        match options.open(&path) {
             Ok(file) => {
-                if let Err(err) =
-                    file.set_permissions(std::fs::Permissions::from_mode(PRIVATE_KEY_FILE_MODE))
-                {
-                    log::warn!(
-                        "Failed to set permissions for private key file {}: {}",
-                        path,
-                        err
-                    );
+                if let Err(err) = set_private_key_permissions(&file, true) {
+                    drop(file);
+                    std::fs::remove_file(&path).with_context(|| {
+                        format!("Failed to remove {} after {err:#}", path.display())
+                    })?;
+                    return Err(err);
                 }
-                Ok(file)
+                return Ok(file);
             }
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                std::fs::OpenOptions::new()
-                    .write(true)
-                    .truncate(true)
-                    .open(path)
+                // Let the OS reject symlink loops before following a dangling link.
+                match std::fs::metadata(&path) {
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => return Err(err.into()),
+                    Ok(_) => return Err(err.into()),
+                }
+                let target = std::fs::read_link(&path)?;
+                path.pop();
+                path.push(target);
             }
-            Err(err) => Err(err),
+            Err(err) => return Err(err.into()),
         }
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::File::create(path)
     }
 }
 
-pub fn gen_sk(wait: u64) -> (String, Option<sign::SecretKey>) {
+#[cfg(unix)]
+fn set_private_key_permissions(file: &std::fs::File, newly_created: bool) -> ResultType<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    const PERMISSION_BITS: u32 = 0o7777;
+    let mode = file.metadata()?.permissions().mode() & PERMISSION_BITS;
+    hbb_common::anyhow::ensure!(
+        !newly_created || mode & !PRIVATE_KEY_FILE_MODE == 0,
+        "Unsafe initial private key permissions: {mode:04o}"
+    );
+    if mode != PRIVATE_KEY_FILE_MODE {
+        file.set_permissions(std::fs::Permissions::from_mode(PRIVATE_KEY_FILE_MODE))
+            .context("Failed to set private key permissions to 0600")?;
+        let mode = file.metadata()?.permissions().mode() & PERMISSION_BITS;
+        hbb_common::anyhow::ensure!(
+            mode == PRIVATE_KEY_FILE_MODE,
+            "Private key permissions are {mode:04o}, expected 0600"
+        );
+    }
+    Ok(())
+}
+
+pub fn gen_sk(wait: u64) -> ResultType<(String, Option<sign::SecretKey>)> {
     let sk_file = "id_ed25519";
     if wait > 0 && !std::path::Path::new(sk_file).exists() {
         std::thread::sleep(std::time::Duration::from_millis(wait));
     }
-    if let Ok(mut file) = std::fs::File::open(sk_file) {
-        let mut contents = String::new();
-        if file.read_to_string(&mut contents).is_ok() {
-            let contents = contents.trim();
-            let sk = base64::decode(contents).unwrap_or_default();
-            if sk.len() == sign::SECRETKEYBYTES {
-                let mut tmp = [0u8; sign::SECRETKEYBYTES];
-                tmp[..].copy_from_slice(&sk);
-                let pk = base64::encode(&tmp[sign::SECRETKEYBYTES / 2..]);
-                log::info!("Private key comes from {}", sk_file);
-                return (pk, Some(sign::SecretKey(tmp)));
-            } else {
-                // don't use log here, since it is async
-                println!("Fatal error: malformed private key in {sk_file}.");
-                std::process::exit(1);
-            }
+    match std::fs::File::open(sk_file) {
+        Ok(mut file) => {
+            #[cfg(unix)]
+            set_private_key_permissions(&file, false)?;
+            let mut contents = String::new();
+            file.read_to_string(&mut contents)
+                .context("Failed to read private key")?;
+            let sk = base64::decode(contents.trim()).context("Malformed private key")?;
+            hbb_common::anyhow::ensure!(sk.len() == sign::SECRETKEYBYTES, "Malformed private key");
+            let mut tmp = [0u8; sign::SECRETKEYBYTES];
+            tmp[..].copy_from_slice(&sk);
+            let pk = base64::encode(&tmp[sign::SECRETKEYBYTES / 2..]);
+            log::info!("Private key comes from {}", sk_file);
+            return Ok((pk, Some(sign::SecretKey(tmp))));
         }
-    } else {
-        let gen_func = || {
-            let (tmp, sk) = sign::gen_keypair();
-            (base64::encode(tmp), sk)
-        };
-        let (mut pk, mut sk) = gen_func();
-        for _ in 0..300 {
-            if !pk.contains('/') && !pk.contains(':') {
-                break;
-            }
-            (pk, sk) = gen_func();
-        }
-        let pub_file = format!("{sk_file}.pub");
-        if let Ok(mut f) = std::fs::File::create(&pub_file) {
-            f.write_all(pk.as_bytes()).ok();
-            if let Ok(mut f) = create_private_key_file(sk_file) {
-                let s = base64::encode(&sk);
-                if f.write_all(s.as_bytes()).is_ok() {
-                    log::info!("Private/public key written to {}/{}", sk_file, pub_file);
-                    log::debug!("Public key: {}", pk);
-                    return (pk, Some(sk));
-                }
-            }
-        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err).context("Failed to open private key"),
     }
-    ("".to_owned(), None)
+    let gen_func = || {
+        let (tmp, sk) = sign::gen_keypair();
+        (base64::encode(tmp), sk)
+    };
+    let (mut pk, mut sk) = gen_func();
+    for _ in 0..300 {
+        if !pk.contains('/') && !pk.contains(':') {
+            break;
+        }
+        (pk, sk) = gen_func();
+    }
+    let pub_file = format!("{sk_file}.pub");
+    let mut f = std::fs::File::create(&pub_file).context("Failed to create public key file")?;
+    f.write_all(pk.as_bytes())
+        .context("Failed to write public key")?;
+    let mut f = create_private_key_file(sk_file).context("Failed to create private key file")?;
+    f.write_all(base64::encode(&sk).as_bytes())
+        .context("Failed to write private key")?;
+    log::info!("Private/public key written to {}/{}", sk_file, pub_file);
+    log::debug!("Public key: {}", pk);
+    Ok((pk, Some(sk)))
 }
 
 #[cfg(unix)]
@@ -473,27 +497,48 @@ mod tests {
 
     #[cfg(unix)]
     fn assert_private_key_file_permissions() {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{symlink, PermissionsExt};
 
         const PERMISSION_BITS: u32 = 0o777;
         const NEW_FILE_MODE: u32 = 0o600;
         const EXISTING_MODE: u32 = 0o644;
-        let path =
+        const RESTRICTIVE_UMASK: hbb_common::libc::mode_t = 0o777;
+        let directory =
             std::env::temp_dir().join(format!("rustdesk-private-key-{}", uuid::Uuid::new_v4()));
-        let file = create_private_key_file(path.to_str().unwrap()).unwrap();
-        assert_eq!(
-            file.metadata().unwrap().permissions().mode() & PERMISSION_BITS,
-            NEW_FILE_MODE
-        );
-        file.set_permissions(std::fs::Permissions::from_mode(EXISTING_MODE))
-            .unwrap();
+        std::fs::create_dir(&directory).unwrap();
+        std::env::set_current_dir(&directory).unwrap();
+        let path = std::path::Path::new("id_ed25519");
+        let mode = || std::fs::metadata(path).unwrap().permissions().mode() & PERMISSION_BITS;
+
+        gen_sk(0).unwrap();
+        assert_eq!(mode(), NEW_FILE_MODE);
+        let contents = std::fs::read(path).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(EXISTING_MODE)).unwrap();
+        let file = std::fs::File::open(path).unwrap();
+        assert!(set_private_key_permissions(&file, true).is_err());
+        assert_eq!(mode(), EXISTING_MODE);
         drop(file);
-        let file = create_private_key_file(path.to_str().unwrap()).unwrap();
-        assert_eq!(
-            file.metadata().unwrap().permissions().mode() & PERMISSION_BITS,
-            EXISTING_MODE
-        );
-        drop(file);
+        gen_sk(0).unwrap();
+        assert_eq!(mode(), NEW_FILE_MODE);
+        assert_eq!(std::fs::read(path).unwrap(), contents);
+        assert!(create_private_key_file("id_ed25519").is_err());
+        assert_eq!(std::fs::read(path).unwrap(), contents);
+
         std::fs::remove_file(path).unwrap();
+        symlink("key-alias", path).unwrap();
+        symlink("key-target", "key-alias").unwrap();
+        gen_sk(0).unwrap();
+        assert_eq!(mode(), NEW_FILE_MODE);
+        assert!(!std::fs::read("key-target").unwrap().is_empty());
+
+        std::fs::remove_file(path).unwrap();
+        unsafe { hbb_common::libc::umask(RESTRICTIVE_UMASK) };
+        gen_sk(0).unwrap();
+        assert_eq!(mode(), NEW_FILE_MODE);
+        let contents = std::fs::read(path).unwrap();
+        gen_sk(0).unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), contents);
+        std::env::set_current_dir(directory.parent().unwrap()).unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }
