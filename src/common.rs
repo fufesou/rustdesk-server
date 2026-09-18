@@ -264,8 +264,46 @@ fn set_private_key_permissions(file: &std::fs::File, newly_created: bool) -> Res
     Ok(())
 }
 
+fn write_public_key(path: &str, pk: &str, required: bool) -> ResultType<()> {
+    match std::fs::read_to_string(path) {
+        Ok(contents) if contents.trim() == pk => return Ok(()),
+        Ok(_) => {
+            let err = hbb_common::anyhow::anyhow!(
+                "Public key in {path} does not match private key in id_ed25519"
+            );
+            log::error!("{err}");
+            return Err(err);
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err).context("Failed to read public key file"),
+    }
+    let mut file = match std::fs::File::create(path) {
+        Ok(file) => file,
+        // Existing private keys may be provisioned in a read-only directory.
+        Err(err) if !required => {
+            log::warn!("Failed to create {path}: {err}; using the existing private key");
+            return Ok(());
+        }
+        Err(err) => return Err(err).context("Failed to create public key file"),
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        const OWNER_READ_WRITE: u32 = 0o600;
+        let mode = file.metadata()?.permissions().mode();
+        if mode & OWNER_READ_WRITE != OWNER_READ_WRITE {
+            file.set_permissions(std::fs::Permissions::from_mode(mode | OWNER_READ_WRITE))
+                .context("Failed to set public key owner permissions")?;
+        }
+    }
+    file.write_all(pk.as_bytes())
+        .context("Failed to write public key")
+}
+
 pub fn gen_sk(wait: u64) -> ResultType<(String, Option<sign::SecretKey>)> {
     let sk_file = "id_ed25519";
+    let pub_file = format!("{sk_file}.pub");
     if wait > 0 && !std::path::Path::new(sk_file).exists() {
         std::thread::sleep(std::time::Duration::from_millis(wait));
     }
@@ -281,6 +319,7 @@ pub fn gen_sk(wait: u64) -> ResultType<(String, Option<sign::SecretKey>)> {
             let mut tmp = [0u8; sign::SECRETKEYBYTES];
             tmp[..].copy_from_slice(&sk);
             let pk = base64::encode(&tmp[sign::SECRETKEYBYTES / 2..]);
+            write_public_key(&pub_file, &pk, false)?;
             log::info!("Private key comes from {}", sk_file);
             return Ok((pk, Some(sign::SecretKey(tmp))));
         }
@@ -301,10 +340,7 @@ pub fn gen_sk(wait: u64) -> ResultType<(String, Option<sign::SecretKey>)> {
     let mut f = create_private_key_file(sk_file).context("Failed to create private key file")?;
     f.write_all(base64::encode(&sk).as_bytes())
         .context("Failed to write private key")?;
-    let pub_file = format!("{sk_file}.pub");
-    let mut f = std::fs::File::create(&pub_file).context("Failed to create public key file")?;
-    f.write_all(pk.as_bytes())
-        .context("Failed to write public key")?;
+    write_public_key(&pub_file, &pk, true)?;
     log::info!("Private/public key written to {}/{}", sk_file, pub_file);
     log::debug!("Public key: {}", pk);
     Ok((pk, Some(sk)))
@@ -499,6 +535,31 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn assert_public_key_recovery() -> String {
+        let sk_file = "id_ed25519";
+        let pub_file = "id_ed25519.pub";
+        std::fs::create_dir(pub_file).unwrap();
+        assert!(gen_sk(0).is_err());
+        let private_key = std::fs::read(sk_file).unwrap();
+        std::fs::remove_dir(pub_file).unwrap();
+        let public_key = gen_sk(0).unwrap().0;
+        assert_eq!(std::fs::read_to_string(pub_file).unwrap(), public_key);
+        let mismatched_key = base64::encode(sign::gen_keypair().0);
+        std::fs::write(pub_file, &mismatched_key).unwrap();
+        assert!(gen_sk(0).is_err());
+        assert!(std::fs::read(sk_file).unwrap() == private_key);
+        assert_eq!(std::fs::read_to_string(pub_file).unwrap(), mismatched_key);
+        std::fs::write(pub_file, &public_key).unwrap();
+        let permissions = std::fs::metadata(pub_file).unwrap().permissions();
+        let mut read_only = permissions.clone();
+        read_only.set_readonly(true);
+        std::fs::set_permissions(pub_file, read_only).unwrap();
+        assert_eq!(gen_sk(0).unwrap().0, public_key);
+        std::fs::set_permissions(pub_file, permissions).unwrap();
+        public_key
+    }
+
+    #[cfg(unix)]
     fn assert_private_key_file_permissions() {
         use std::os::unix::fs::{symlink, PermissionsExt};
 
@@ -514,14 +575,13 @@ mod tests {
         let path = std::path::Path::new("id_ed25519");
         let mode = || std::fs::metadata(path).unwrap().permissions().mode() & PERMISSION_BITS;
 
-        let public_key = gen_sk(0).unwrap().0;
+        let public_key = assert_public_key_recovery();
         assert_eq!(mode(), NEW_FILE_MODE);
         let contents = std::fs::read(path).unwrap();
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(EXISTING_MODE)).unwrap();
         let file = std::fs::File::open(path).unwrap();
         assert!(set_private_key_permissions(&file, true).is_err());
         assert_eq!(mode(), EXISTING_MODE);
-        drop(file);
         gen_sk(0).unwrap();
         assert_eq!(mode(), NEW_FILE_MODE);
         assert_eq!(std::fs::read(path).unwrap(), contents);
@@ -536,6 +596,7 @@ mod tests {
         assert!(gen_sk(0).is_err());
         assert!(std::fs::read_to_string("id_ed25519.pub").unwrap() == public_key);
         std::fs::remove_file(path).unwrap();
+        std::fs::remove_file("id_ed25519.pub").unwrap();
         symlink("key-alias", path).unwrap();
         symlink("key-target", "key-alias").unwrap();
         gen_sk(0).unwrap();
@@ -543,6 +604,7 @@ mod tests {
         assert!(!std::fs::read("key-target").unwrap().is_empty());
 
         std::fs::remove_file(path).unwrap();
+        std::fs::remove_file("id_ed25519.pub").unwrap();
         unsafe { hbb_common::libc::umask(RESTRICTIVE_UMASK) };
         gen_sk(0).unwrap();
         assert_eq!(mode(), NEW_FILE_MODE);
