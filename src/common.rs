@@ -5,6 +5,7 @@ use hbb_common::{
 use ini::Ini;
 use sodiumoxide::crypto::sign;
 use std::{
+    fs,
     io::prelude::*,
     io::Read,
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -196,55 +197,61 @@ pub fn now() -> u64 {
 
 #[cfg(unix)]
 const PRIVATE_KEY_FILE_MODE: u32 = 0o600;
+const MAX_KEY_SYMLINKS: usize = 40;
 
-#[cfg(not(unix))]
-fn create_private_key_file(path: &str) -> ResultType<std::fs::File> {
-    Ok(std::fs::File::create(path)?)
-}
-
-/// Restricts access from creation so another user cannot retain a readable descriptor.
-/// Follows dangling symlinks for configured key paths, but never overwrites an existing key.
-/// Verifies permissions before returning; on failure, closes and tries to remove the empty file.
-#[cfg(unix)]
-fn create_private_key_file(path: &str) -> ResultType<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let mut path = std::path::PathBuf::from(path);
-    let mut options = std::fs::OpenOptions::new();
-    options
-        .write(true)
-        .create_new(true)
-        .mode(PRIVATE_KEY_FILE_MODE);
-    loop {
-        match options.open(&path) {
-            Ok(file) => {
-                if let Err(err) = set_private_key_permissions(&file, true) {
-                    drop(file);
-                    std::fs::remove_file(&path).with_context(|| {
-                        format!("Failed to remove {} after {err:#}", path.display())
-                    })?;
-                    return Err(err);
-                }
-                return Ok(file);
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                // Let the OS reject symlink loops before following a dangling link.
-                match std::fs::metadata(&path) {
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(err) => return Err(err.into()),
-                    Ok(_) => return Err(err.into()),
-                }
-                let target = std::fs::read_link(&path)?;
-                path.pop();
-                path.push(target);
-            }
+fn resolve_key_path(path: &Path) -> ResultType<PathBuf> {
+    let mut path = path.to_path_buf();
+    // Bound traversal even if symlinks change while they are being resolved.
+    for hops in 0..=MAX_KEY_SYMLINKS {
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {}
+            Ok(_) => return Ok(path),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(path),
             Err(err) => return Err(err.into()),
         }
+        if hops == MAX_KEY_SYMLINKS {
+            break;
+        }
+        let target = fs::read_link(&path)?;
+        path.pop();
+        path.push(target);
     }
+    hbb_common::anyhow::bail!(
+        "Too many key symlinks (limit: {MAX_KEY_SYMLINKS}): {}",
+        path.display()
+    );
+}
+
+/// On Unix, restricts access from creation so another user cannot retain a readable descriptor.
+/// Follows dangling symlinks for configured key paths, but never overwrites an existing key.
+/// Writes after verifying Unix permissions; failures close and try to remove the new file.
+fn create_private_key_file(path: &str, contents: &[u8]) -> ResultType<()> {
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let path = resolve_key_path(Path::new(path))?;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(PRIVATE_KEY_FILE_MODE);
+    let mut file = options.open(&path)?;
+    let result = (|| {
+        #[cfg(unix)]
+        set_private_key_permissions(&file, true)?;
+        file.write_all(contents)
+            .context("Failed to write private key")
+    })();
+    if let Err(err) = result {
+        drop(file);
+        fs::remove_file(&path)
+            .with_context(|| format!("Failed to remove {} after {err:#}", path.display()))?;
+        return Err(err);
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
-fn set_private_key_permissions(file: &std::fs::File, newly_created: bool) -> ResultType<()> {
+fn set_private_key_permissions(file: &fs::File, newly_created: bool) -> ResultType<()> {
     use std::os::unix::fs::PermissionsExt;
 
     const PERMISSION_BITS: u32 = 0o7777;
@@ -257,7 +264,7 @@ fn set_private_key_permissions(file: &std::fs::File, newly_created: bool) -> Res
         "Unsafe initial private key permissions: {mode:04o}"
     );
     if mode != PRIVATE_KEY_FILE_MODE {
-        file.set_permissions(std::fs::Permissions::from_mode(PRIVATE_KEY_FILE_MODE))
+        file.set_permissions(fs::Permissions::from_mode(PRIVATE_KEY_FILE_MODE))
             .context("Failed to set private key permissions to 0600")?;
         let mode = file.metadata()?.permissions().mode() & PERMISSION_BITS;
         hbb_common::anyhow::ensure!(
@@ -269,31 +276,19 @@ fn set_private_key_permissions(file: &std::fs::File, newly_created: bool) -> Res
 }
 
 fn missing_public_key_path(path: &Path, pk: &str) -> ResultType<Option<PathBuf>> {
-    let mut path = path.to_path_buf();
-    loop {
-        match std::fs::read_to_string(&path) {
-            Ok(contents) if contents.trim() == pk => return Ok(None),
-            Ok(_) => {
-                let err = hbb_common::anyhow::anyhow!(
-                    "Public key in {} does not match private key in id_ed25519",
-                    path.display()
-                );
-                log::error!("{err}");
-                return Err(err);
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => return Err(err).context("Failed to read public key file"),
+    let path = resolve_key_path(path).context("Failed to resolve public key path")?;
+    match fs::read_to_string(&path) {
+        Ok(contents) if contents.trim() == pk => Ok(None),
+        Ok(_) => {
+            let err = hbb_common::anyhow::anyhow!(
+                "Public key in {} does not match private key in id_ed25519",
+                path.display()
+            );
+            log::error!("{err}");
+            Err(err)
         }
-        match std::fs::symlink_metadata(&path) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                let target = std::fs::read_link(&path)?;
-                path.pop();
-                path.push(target);
-            }
-            Ok(_) => continue,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Some(path)),
-            Err(err) => return Err(err).context("Failed to resolve public key path"),
-        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Some(path)),
+        Err(err) => Err(err).context("Failed to read public key file"),
     }
 }
 
@@ -319,7 +314,7 @@ fn write_public_key(path: &str, pk: &str, required: bool) -> ResultType<()> {
         return Ok(());
     };
     let temporary = path.with_file_name(format!(".id_ed25519.pub.{}", uuid::Uuid::new_v4()));
-    let mut file = match std::fs::OpenOptions::new()
+    let mut file = match fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&temporary)
@@ -343,7 +338,7 @@ fn write_public_key(path: &str, pk: &str, required: bool) -> ResultType<()> {
         const OWNER_READ_WRITE: u32 = 0o600;
         let mode = file.metadata()?.permissions().mode();
         if mode & OWNER_READ_WRITE != OWNER_READ_WRITE {
-            file.set_permissions(std::fs::Permissions::from_mode(mode | OWNER_READ_WRITE))
+            file.set_permissions(fs::Permissions::from_mode(mode | OWNER_READ_WRITE))
                 .context("Failed to set public key owner permissions")?;
         }
     }
@@ -360,7 +355,7 @@ pub fn gen_sk(wait: u64) -> ResultType<(String, Option<sign::SecretKey>)> {
     if wait > 0 && !std::path::Path::new(sk_file).exists() {
         std::thread::sleep(std::time::Duration::from_millis(wait));
     }
-    match std::fs::File::open(sk_file) {
+    match fs::File::open(sk_file) {
         Ok(mut file) => {
             #[cfg(unix)]
             set_private_key_permissions(&file, false)?;
@@ -368,13 +363,11 @@ pub fn gen_sk(wait: u64) -> ResultType<(String, Option<sign::SecretKey>)> {
             file.read_to_string(&mut contents)
                 .context("Failed to read private key")?;
             let sk = base64::decode(contents.trim()).context("Malformed private key")?;
-            hbb_common::anyhow::ensure!(sk.len() == sign::SECRETKEYBYTES, "Malformed private key");
-            let mut tmp = [0u8; sign::SECRETKEYBYTES];
-            tmp[..].copy_from_slice(&sk);
-            let pk = base64::encode(&tmp[sign::SECRETKEYBYTES / 2..]);
+            let sk = sign::SecretKey::from_slice(&sk).context("Malformed private key")?;
+            let pk = base64::encode(sk.public_key());
             write_public_key(&pub_file, &pk, false)?;
             log::info!("Private key comes from {}", sk_file);
-            return Ok((pk, Some(sign::SecretKey(tmp))));
+            return Ok((pk, Some(sk)));
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
         Err(err) => return Err(err).context("Failed to open private key"),
@@ -390,9 +383,9 @@ pub fn gen_sk(wait: u64) -> ResultType<(String, Option<sign::SecretKey>)> {
         }
         (pk, sk) = gen_func();
     }
-    let mut f = create_private_key_file(sk_file).context("Failed to create private key file")?;
-    f.write_all(base64::encode(&sk).as_bytes())
-        .context("Failed to write private key")?;
+    missing_public_key_path(Path::new(&pub_file), &pk)?;
+    create_private_key_file(sk_file, base64::encode(&sk).as_bytes())
+        .context("Failed to create private key file")?;
     write_public_key(&pub_file, &pk, true)?;
     log::info!("Private/public key written to {}/{}", sk_file, pub_file);
     log::debug!("Public key: {}", pk);
@@ -558,6 +551,30 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn key_path_symlinks_are_bounded() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target");
+        let mut path = target.clone();
+        for index in 0..MAX_KEY_SYMLINKS {
+            let link = directory.path().join(format!("link-{index}"));
+            symlink(&path, &link).unwrap();
+            path = link;
+        }
+        assert_eq!(resolve_key_path(&path).unwrap(), target);
+        let extra = directory.path().join("extra");
+        symlink(&path, &extra).unwrap();
+        let cycle = directory.path().join("cycle");
+        symlink(&cycle, &cycle).unwrap();
+        for path in [&extra, &cycle] {
+            let error = resolve_key_path(path).unwrap_err();
+            assert!(error.to_string().starts_with("Too many key symlinks"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn private_key_file_permissions() {
         use std::process::Command;
 
@@ -588,31 +605,35 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    fn assert_public_key_write_failure(public_key: &str) {
+    fn with_file_size_limit<T>(limit: hbb_common::libc::rlim_t, run: impl FnOnce() -> T) -> T {
         use hbb_common::libc;
 
-        const WRITE_LIMIT: libc::rlim_t = 16;
-        let pub_file = "id_ed25519.pub";
-        std::fs::remove_file(pub_file).unwrap();
-        let result = unsafe {
+        unsafe {
             let mut limits = std::mem::zeroed();
             assert_eq!(libc::getrlimit(libc::RLIMIT_FSIZE, &mut limits), 0);
             let handler = libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
             assert_ne!(handler, libc::SIG_ERR);
             let restricted = libc::rlimit {
-                rlim_cur: WRITE_LIMIT,
+                rlim_cur: limit,
                 ..limits
             };
             assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &restricted), 0);
-            let result = gen_sk(0);
+            let result = run();
             assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &limits), 0);
             assert_ne!(libc::signal(libc::SIGXFSZ, handler), libc::SIG_ERR);
             result
-        };
-        assert!(result.is_err());
-        assert!(!std::path::Path::new(pub_file).exists());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_public_key_write_failure(public_key: &str) {
+        const WRITE_LIMIT: hbb_common::libc::rlim_t = 16;
+        let pub_file = "id_ed25519.pub";
+        fs::remove_file(pub_file).unwrap();
+        assert!(with_file_size_limit(WRITE_LIMIT, || gen_sk(0)).is_err());
+        assert!(!Path::new(pub_file).exists());
         assert_eq!(gen_sk(0).unwrap().0, public_key);
-        assert_eq!(std::fs::read_to_string(pub_file).unwrap(), public_key);
+        assert_eq!(fs::read_to_string(pub_file).unwrap(), public_key);
     }
 
     #[cfg(unix)]
@@ -621,12 +642,20 @@ mod tests {
 
         let sk_file = "id_ed25519";
         let pub_file = "id_ed25519.pub";
-        std::fs::create_dir(pub_file).unwrap();
+        let mismatched_key = base64::encode(sign::gen_keypair().0);
+        fs::write(pub_file, &mismatched_key).unwrap();
         assert!(gen_sk(0).is_err());
-        let private_key = std::fs::read(sk_file).unwrap();
-        std::fs::remove_dir(pub_file).unwrap();
+        assert!(!Path::new(sk_file).exists());
+        assert_eq!(fs::read_to_string(pub_file).unwrap(), mismatched_key);
+        fs::remove_file(pub_file).unwrap();
         let public_key = gen_sk(0).unwrap().0;
-        assert_eq!(std::fs::read_to_string(pub_file).unwrap(), public_key);
+        let private_key = fs::read(sk_file).unwrap();
+        fs::remove_file(pub_file).unwrap();
+        fs::create_dir(pub_file).unwrap();
+        assert!(gen_sk(0).is_err());
+        fs::remove_dir(pub_file).unwrap();
+        assert_eq!(gen_sk(0).unwrap().0, public_key);
+        assert_eq!(fs::read_to_string(pub_file).unwrap(), public_key);
         #[cfg(target_os = "linux")]
         assert_public_key_write_failure(&public_key);
         let path = Path::new(pub_file);
@@ -635,26 +664,19 @@ mod tests {
             file.write_all(pk.as_bytes()).unwrap();
             file.into_temp_path()
         };
-        std::fs::remove_file(path).unwrap();
+        fs::remove_file(path).unwrap();
         let pending = prepare(&public_key);
         gen_sk(0).unwrap();
-        let inode = std::fs::metadata(path).unwrap().ino();
+        let inode = fs::metadata(path).unwrap().ino();
         publish_public_key(pending, path, &public_key).unwrap();
-        let mismatched_key = base64::encode(sign::gen_keypair().0);
         assert!(publish_public_key(prepare(&mismatched_key), path, &mismatched_key).is_err());
-        assert_eq!(std::fs::metadata(path).unwrap().ino(), inode);
-        assert_eq!(std::fs::read_to_string(path).unwrap(), public_key);
-        std::fs::write(pub_file, &mismatched_key).unwrap();
+        assert_eq!(fs::metadata(path).unwrap().ino(), inode);
+        assert_eq!(fs::read_to_string(path).unwrap(), public_key);
+        fs::write(pub_file, &mismatched_key).unwrap();
         assert!(gen_sk(0).is_err());
-        assert!(std::fs::read(sk_file).unwrap() == private_key);
-        assert_eq!(std::fs::read_to_string(pub_file).unwrap(), mismatched_key);
-        std::fs::write(pub_file, &public_key).unwrap();
-        let permissions = std::fs::metadata(pub_file).unwrap().permissions();
-        let mut read_only = permissions.clone();
-        read_only.set_readonly(true);
-        std::fs::set_permissions(pub_file, read_only).unwrap();
-        assert_eq!(gen_sk(0).unwrap().0, public_key);
-        std::fs::set_permissions(pub_file, permissions).unwrap();
+        assert!(fs::read(sk_file).unwrap() == private_key);
+        assert_eq!(fs::read_to_string(pub_file).unwrap(), mismatched_key);
+        fs::write(pub_file, &public_key).unwrap();
         public_key
     }
 
@@ -667,50 +689,47 @@ mod tests {
         const EXISTING_MODE: u32 = 0o644;
         const READ_ONLY_MODE: u32 = 0o400;
         const RESTRICTIVE_UMASK: hbb_common::libc::mode_t = 0o777;
-        let directory =
-            std::env::temp_dir().join(format!("rustdesk-private-key-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir(&directory).unwrap();
-        std::env::set_current_dir(&directory).unwrap();
-        let path = std::path::Path::new("id_ed25519");
-        let mode = || std::fs::metadata(path).unwrap().permissions().mode() & PERMISSION_BITS;
-
+        let directory = tempfile::tempdir().unwrap();
+        std::env::set_current_dir(directory.path()).unwrap();
+        let path = Path::new("id_ed25519");
+        let mode = || fs::metadata(path).unwrap().permissions().mode() & PERMISSION_BITS;
+        symlink("key-alias", path).unwrap();
+        symlink("key-target", "key-alias").unwrap();
+        #[cfg(target_os = "linux")]
+        {
+            const PARTIAL_WRITE_LIMIT: hbb_common::libc::rlim_t = 16;
+            for limit in [0, PARTIAL_WRITE_LIMIT] {
+                assert!(with_file_size_limit(limit, || gen_sk(0)).is_err());
+                assert!(path.is_symlink() && Path::new("key-alias").is_symlink());
+                assert!(!Path::new("key-target").exists());
+                assert!(!Path::new("id_ed25519.pub").exists());
+            }
+        }
         let public_key = assert_public_key_recovery();
         assert_eq!(mode(), NEW_FILE_MODE);
-        let contents = std::fs::read(path).unwrap();
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(EXISTING_MODE)).unwrap();
-        let file = std::fs::File::open(path).unwrap();
+        let contents = fs::read(path).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(EXISTING_MODE)).unwrap();
+        let file = fs::File::open(path).unwrap();
         assert!(set_private_key_permissions(&file, true).is_err());
         assert_eq!(mode(), EXISTING_MODE);
         gen_sk(0).unwrap();
         assert_eq!(mode(), NEW_FILE_MODE);
-        assert_eq!(std::fs::read(path).unwrap(), contents);
-        assert!(create_private_key_file("id_ed25519").is_err());
-        assert_eq!(std::fs::read(path).unwrap(), contents);
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(READ_ONLY_MODE)).unwrap();
+        assert_eq!(fs::read(path).unwrap(), contents);
+        assert!(create_private_key_file("id_ed25519", b"do not overwrite").is_err());
+        assert_eq!(fs::read(path).unwrap(), contents);
+        fs::set_permissions(path, fs::Permissions::from_mode(READ_ONLY_MODE)).unwrap();
+        fs::set_permissions("id_ed25519.pub", fs::Permissions::from_mode(READ_ONLY_MODE)).unwrap();
         assert_eq!(gen_sk(0).unwrap().0, public_key);
         assert_eq!(mode(), READ_ONLY_MODE);
 
-        std::fs::remove_file(path).unwrap();
-        symlink("missing/key", path).unwrap();
-        assert!(gen_sk(0).is_err());
-        assert!(std::fs::read_to_string("id_ed25519.pub").unwrap() == public_key);
-        std::fs::remove_file(path).unwrap();
-        std::fs::remove_file("id_ed25519.pub").unwrap();
-        symlink("key-alias", path).unwrap();
-        symlink("key-target", "key-alias").unwrap();
-        gen_sk(0).unwrap();
-        assert_eq!(mode(), NEW_FILE_MODE);
-        assert!(!std::fs::read("key-target").unwrap().is_empty());
-
-        std::fs::remove_file(path).unwrap();
-        std::fs::remove_file("id_ed25519.pub").unwrap();
+        fs::remove_file(path).unwrap();
+        fs::remove_file("id_ed25519.pub").unwrap();
         unsafe { hbb_common::libc::umask(RESTRICTIVE_UMASK) };
         gen_sk(0).unwrap();
         assert_eq!(mode(), NEW_FILE_MODE);
-        let contents = std::fs::read(path).unwrap();
+        let contents = fs::read(path).unwrap();
         gen_sk(0).unwrap();
-        assert_eq!(std::fs::read(path).unwrap(), contents);
-        std::env::set_current_dir(directory.parent().unwrap()).unwrap();
-        std::fs::remove_dir_all(directory).unwrap();
+        assert_eq!(fs::read(path).unwrap(), contents);
+        std::env::set_current_dir(directory.path().parent().unwrap()).unwrap();
     }
 }
