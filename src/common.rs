@@ -202,6 +202,9 @@ fn create_private_key_file(path: &str) -> ResultType<std::fs::File> {
     Ok(std::fs::File::create(path)?)
 }
 
+/// Restricts access from creation so another user cannot retain a readable descriptor.
+/// Follows dangling symlinks for configured key paths, but never overwrites an existing key.
+/// Verifies permissions before returning; on failure, closes and tries to remove the empty file.
 #[cfg(unix)]
 fn create_private_key_file(path: &str) -> ResultType<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
@@ -308,6 +311,9 @@ fn publish_public_key(file: tempfile::TempPath, path: &Path, pk: &str) -> Result
     }
 }
 
+/// Publishes a fully written temporary file so interrupted writes cannot expose partial public keys.
+/// Preserves existing files: matching public keys are accepted, while mismatches return errors.
+/// With `required = false`, temp-file creation failure only warns to support read-only provisioning.
 fn write_public_key(path: &str, pk: &str, required: bool) -> ResultType<()> {
     let Some(path) = missing_public_key_path(Path::new(path), pk)? else {
         return Ok(());
