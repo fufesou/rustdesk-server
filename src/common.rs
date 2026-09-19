@@ -202,15 +202,12 @@ const MAX_KEY_SYMLINKS: usize = 40;
 fn resolve_key_path(path: &Path) -> ResultType<PathBuf> {
     let mut path = path.to_path_buf();
     // Bound traversal even if symlinks change while they are being resolved.
-    for hops in 0..=MAX_KEY_SYMLINKS {
+    for _ in 0..MAX_KEY_SYMLINKS {
         match fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.file_type().is_symlink() => {}
             Ok(_) => return Ok(path),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(path),
             Err(err) => return Err(err.into()),
-        }
-        if hops == MAX_KEY_SYMLINKS {
-            break;
         }
         let target = fs::read_link(&path)?;
         path.pop();
@@ -557,7 +554,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let target = directory.path().join("target");
         let mut path = target.clone();
-        for index in 0..MAX_KEY_SYMLINKS {
+        for index in 1..MAX_KEY_SYMLINKS {
             let link = directory.path().join(format!("link-{index}"));
             symlink(&path, &link).unwrap();
             path = link;
