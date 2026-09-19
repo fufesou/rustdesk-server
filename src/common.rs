@@ -8,6 +8,7 @@ use std::{
     io::prelude::*,
     io::Read,
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    path::{Path, PathBuf},
     time::{Instant, SystemTime},
 };
 
@@ -264,28 +265,71 @@ fn set_private_key_permissions(file: &std::fs::File, newly_created: bool) -> Res
     Ok(())
 }
 
-fn write_public_key(path: &str, pk: &str, required: bool) -> ResultType<()> {
-    match std::fs::read_to_string(path) {
-        Ok(contents) if contents.trim() == pk => return Ok(()),
-        Ok(_) => {
-            let err = hbb_common::anyhow::anyhow!(
-                "Public key in {path} does not match private key in id_ed25519"
-            );
-            log::error!("{err}");
-            return Err(err);
+fn missing_public_key_path(path: &Path, pk: &str) -> ResultType<Option<PathBuf>> {
+    let mut path = path.to_path_buf();
+    loop {
+        match std::fs::read_to_string(&path) {
+            Ok(contents) if contents.trim() == pk => return Ok(None),
+            Ok(_) => {
+                let err = hbb_common::anyhow::anyhow!(
+                    "Public key in {} does not match private key in id_ed25519",
+                    path.display()
+                );
+                log::error!("{err}");
+                return Err(err);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err).context("Failed to read public key file"),
         }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => return Err(err).context("Failed to read public key file"),
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                let target = std::fs::read_link(&path)?;
+                path.pop();
+                path.push(target);
+            }
+            Ok(_) => continue,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Some(path)),
+            Err(err) => return Err(err).context("Failed to resolve public key path"),
+        }
     }
-    let mut file = match std::fs::File::create(path) {
+}
+
+fn publish_public_key(file: tempfile::TempPath, path: &Path, pk: &str) -> ResultType<()> {
+    match file.persist_noclobber(path) {
+        Ok(_) => Ok(()),
+        Err(err) if err.error.kind() == std::io::ErrorKind::AlreadyExists => {
+            hbb_common::anyhow::ensure!(
+                missing_public_key_path(path, pk)?.is_none(),
+                "Public key disappeared during publication"
+            );
+            Ok(())
+        }
+        Err(err) => Err(err.error).context("Failed to publish public key file"),
+    }
+}
+
+fn write_public_key(path: &str, pk: &str, required: bool) -> ResultType<()> {
+    let Some(path) = missing_public_key_path(Path::new(path), pk)? else {
+        return Ok(());
+    };
+    let temporary = path.with_file_name(format!(".id_ed25519.pub.{}", uuid::Uuid::new_v4()));
+    let mut file = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+    {
         Ok(file) => file,
         // Existing private keys may be provisioned in a read-only directory.
         Err(err) if !required => {
-            log::warn!("Failed to create {path}: {err}; using the existing private key");
+            log::warn!(
+                "Failed to create {}: {err}; using the existing private key",
+                path.display()
+            );
             return Ok(());
         }
         Err(err) => return Err(err).context("Failed to create public key file"),
     };
+    let temporary = tempfile::TempPath::from_path(temporary);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -298,7 +342,10 @@ fn write_public_key(path: &str, pk: &str, required: bool) -> ResultType<()> {
         }
     }
     file.write_all(pk.as_bytes())
-        .context("Failed to write public key")
+        .context("Failed to write public key")?;
+    file.sync_all().context("Failed to sync public key")?;
+    drop(file);
+    publish_public_key(temporary, &path, pk)
 }
 
 pub fn gen_sk(wait: u64) -> ResultType<(String, Option<sign::SecretKey>)> {
@@ -534,8 +581,38 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    fn assert_public_key_write_failure(public_key: &str) {
+        use hbb_common::libc;
+
+        const WRITE_LIMIT: libc::rlim_t = 16;
+        let pub_file = "id_ed25519.pub";
+        std::fs::remove_file(pub_file).unwrap();
+        let result = unsafe {
+            let mut limits = std::mem::zeroed();
+            assert_eq!(libc::getrlimit(libc::RLIMIT_FSIZE, &mut limits), 0);
+            let handler = libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+            assert_ne!(handler, libc::SIG_ERR);
+            let restricted = libc::rlimit {
+                rlim_cur: WRITE_LIMIT,
+                ..limits
+            };
+            assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &restricted), 0);
+            let result = gen_sk(0);
+            assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &limits), 0);
+            assert_ne!(libc::signal(libc::SIGXFSZ, handler), libc::SIG_ERR);
+            result
+        };
+        assert!(result.is_err());
+        assert!(!std::path::Path::new(pub_file).exists());
+        assert_eq!(gen_sk(0).unwrap().0, public_key);
+        assert_eq!(std::fs::read_to_string(pub_file).unwrap(), public_key);
+    }
+
     #[cfg(unix)]
     fn assert_public_key_recovery() -> String {
+        use std::os::unix::fs::MetadataExt;
+
         let sk_file = "id_ed25519";
         let pub_file = "id_ed25519.pub";
         std::fs::create_dir(pub_file).unwrap();
@@ -544,7 +621,23 @@ mod tests {
         std::fs::remove_dir(pub_file).unwrap();
         let public_key = gen_sk(0).unwrap().0;
         assert_eq!(std::fs::read_to_string(pub_file).unwrap(), public_key);
+        #[cfg(target_os = "linux")]
+        assert_public_key_write_failure(&public_key);
+        let path = Path::new(pub_file);
+        let prepare = |pk: &str| {
+            let mut file = tempfile::NamedTempFile::new_in(".").unwrap();
+            file.write_all(pk.as_bytes()).unwrap();
+            file.into_temp_path()
+        };
+        std::fs::remove_file(path).unwrap();
+        let pending = prepare(&public_key);
+        gen_sk(0).unwrap();
+        let inode = std::fs::metadata(path).unwrap().ino();
+        publish_public_key(pending, path, &public_key).unwrap();
         let mismatched_key = base64::encode(sign::gen_keypair().0);
+        assert!(publish_public_key(prepare(&mismatched_key), path, &mismatched_key).is_err());
+        assert_eq!(std::fs::metadata(path).unwrap().ino(), inode);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), public_key);
         std::fs::write(pub_file, &mismatched_key).unwrap();
         assert!(gen_sk(0).is_err());
         assert!(std::fs::read(sk_file).unwrap() == private_key);
